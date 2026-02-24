@@ -1,0 +1,617 @@
+Generate a complete Spring Boot Maven project that runs as a local web server with a rich dark-themed UI.
+When the JAR runs it opens http://localhost:8080 automatically in the browser.
+The user pastes or uploads a Swagger YAML/JSON file, types acceptance criteria, and clicks Generate.
+The app uses Claude AI to produce Manual and Automation test cases shown in a rich table UI.
+User can download Excel, CSV, and Postman collection.
+
+═══════════════════════════════════════════════════════════
+SECTION 1 — pom.xml
+═══════════════════════════════════════════════════════════
+
+groupId: com.testgen
+artifactId: swagger-test-agent
+version: 1.0.0
+Java: 17
+Spring Boot parent: 3.2.0
+Packaging: jar
+
+Dependencies:
+- spring-boot-starter-web
+- spring-boot-starter-thymeleaf
+- io.swagger.parser.v3:swagger-parser:2.1.19
+- org.apache.poi:poi-ooxml:5.2.5
+- com.google.code.gson:gson:2.10.1
+- org.apache.httpcomponents.client5:httpclient5:5.3
+- org.apache.commons:commons-csv:1.10.0
+- org.projectlombok:lombok (optional=true)
+
+spring-boot-maven-plugin configuration:
+- executable: true
+- mainClass: com.testgen.SwaggerTestAgentApplication
+
+═══════════════════════════════════════════════════════════
+SECTION 2 — application.properties
+═══════════════════════════════════════════════════════════
+
+server.port=8080
+anthropic.api.key=YOUR_ANTHROPIC_API_KEY_HERE
+anthropic.model=claude-sonnet-4-6
+output.directory=./test-output
+spring.thymeleaf.cache=false
+
+═══════════════════════════════════════════════════════════
+SECTION 3 — SwaggerTestAgentApplication.java
+═══════════════════════════════════════════════════════════
+
+Package: com.testgen
+@SpringBootApplication class.
+main() method:
+  1. Call SpringApplication.run()
+  2. After startup, auto-open browser using Desktop.getDesktop().browse(URI.create("http://localhost:8080"))
+     Wrap in try-catch, print message if browser cannot open.
+  3. Print to console:
+     ╔══════════════════════════════════════════╗
+     ║   Swagger AI Test Case Generator         ║
+     ║   Open: http://localhost:8080            ║
+     ╚══════════════════════════════════════════╝
+
+═══════════════════════════════════════════════════════════
+SECTION 4 — Model classes in com.testgen.model
+═══════════════════════════════════════════════════════════
+
+4A. TestCase.java — @Data @Builder @AllArgsConstructor @NoArgsConstructor
+Fields:
+- String testId          // TC_001
+- String type            // "MANUAL" or "AUTOMATION"
+- String endpointPath    // /api/customers
+- String httpMethod      // POST, GET etc
+- String field           // field being tested
+- String category        // Length-Boundary, Pattern, Security etc
+- String scenario        // human readable scenario name
+- String precondition    // what must be true before test
+- String testSteps       // step by step actions (manual only)
+- String testData        // input test data
+- String expectedResult  // what should happen
+- String actualResult    // blank, tester fills this
+- String status          // blank, tester fills: Pass/Fail
+- String priority        // High / Medium / Low
+- String automationCode  // JUnit/RestAssured code (automation only)
+
+4B. GenerateRequest.java — @Data
+Fields:
+- String swaggerContent    // raw YAML or JSON pasted by user
+- String acceptanceCriteria  // user stories / acceptance criteria text
+- String apiKey            // Anthropic API key entered in UI
+- String baseUrl           // API base URL
+
+4C. GenerateResponse.java — @Data @Builder
+Fields:
+- boolean success
+- String message
+- List<TestCase> manualTestCases
+- List<TestCase> automationTestCases
+- int totalManual
+- int totalAutomation
+- String summary
+
+4D. FieldConstraint.java — @Data @Builder @AllArgsConstructor @NoArgsConstructor
+Fields:
+- String fieldName, fieldPath, type, format, pattern, description
+- boolean required, nullable
+- Integer minLength, maxLength, minItems, maxItems
+- Double minimum, maximum
+- List<String> enumValues
+
+4E. EndpointInfo.java — @Data @Builder @AllArgsConstructor @NoArgsConstructor
+Fields:
+- String path, method, summary, operationId
+- List<FieldConstraint> bodyConstraints
+- List<FieldConstraint> paramConstraints
+
+═══════════════════════════════════════════════════════════
+SECTION 5 — SwaggerParserService.java in com.testgen.service
+═══════════════════════════════════════════════════════════
+
+@Service class.
+
+parseSwagger(String swaggerContent) returns List<EndpointInfo>:
+  1. Detect if content is URL (starts with http), file path, or raw YAML/JSON string
+  2. If raw string: write to temp file, parse with OpenAPIV3Parser
+     ParseOptions: setResolve(true), setResolveFully(true)
+  3. If URL: pass directly to OpenAPIV3Parser.read()
+  4. Extract all endpoints (GET/POST/PUT/PATCH/DELETE)
+  5. For each operation extract EndpointInfo:
+     - path, method, summary, operationId
+     - bodyConstraints from requestBody -> application/json schema
+     - paramConstraints from parameters list
+  6. extractSchemaConstraints(Schema, String path, Set<String> visited) private method:
+     Recursively extract all field constraints handling nested objects and arrays.
+     For each property extract: type, format, minLength, maxLength, pattern,
+     minimum, maximum, enum, required, nullable, minItems, maxItems
+  7. Return List<EndpointInfo>. On any error throw RuntimeException with clear message.
+
+═══════════════════════════════════════════════════════════
+SECTION 6 — ManualTestCaseGeneratorService.java in com.testgen.service
+═══════════════════════════════════════════════════════════
+
+@Service class. AtomicInteger counter for MT_001 IDs.
+
+generateManualTestCases(List<EndpointInfo> endpoints, String acceptanceCriteria) returns List<TestCase>:
+
+For each endpoint, for each FieldConstraint, generate these manual test cases.
+Each TestCase must have: testId (MT_001 format), type=MANUAL, endpointPath, httpMethod, field,
+category, scenario, precondition, testSteps, testData, expectedResult, priority.
+
+Generate for STRING fields:
+- Category "Positive": valid value within limits
+    precondition="API is running and user is authenticated"
+    testSteps="1. Send POST request to {path}\n2. Set {field} to valid value\n3. Submit request"
+    testData=example valid value, expectedResult="Response 200/201 with success message"
+- Category "Empty Validation": empty string ""
+    testSteps="1. Send request\n2. Set {field} to empty string\n3. Submit"
+    testData="(empty)", expectedResult="Response 400 with validation error message for {field}"
+- Category "Length-Min Boundary": if minLength exists, value of minLength-1 chars
+    testData="{minLength-1} character string", expectedResult="400 - field too short error"
+- Category "Length-Min Boundary": exact minLength chars, expectedResult="200 - accepted"
+- Category "Length-Max Boundary": if maxLength exists, maxLength+1 chars
+    testData="{maxLength+1} character string", expectedResult="400 - field too long error"
+- Category "Length-Max Boundary": exact maxLength chars, expectedResult="200 - accepted"
+- Category "Special Characters": value "!@#$%^&*()"
+    expectedResult="400 - invalid characters error"
+- Category "SQL Injection": value "' OR '1'='1'; DROP TABLE--"
+    expectedResult="400 - request rejected"
+- Category "XSS Attack": value "<script>alert(1)</script>"
+    expectedResult="400 - request rejected"
+- Category "Null Check": null value, if not nullable expectedResult="400 error"
+- Category "Whitespace": "   " spaces only, expectedResult="400 error"
+
+Generate for PATTERN fields additionally:
+- Category "Pattern-Valid": value matching the pattern, expectedResult="200 accepted"
+- Category "Pattern-Invalid": value not matching, expectedResult="400 pattern error"
+- If description contains "email": "invalidemail.com" -> 400, "user@example.com" -> 200
+- If description contains "phone": "12345" -> 400, "9876543210" -> 200
+- If description contains "pan": "ABCDE1234" -> 400, "ABCDE1234F" -> 200
+- If description contains "ifsc": "SBIN001" -> 400, "SBIN0001234" -> 200
+- If description contains "pincode" or "zip": "123" -> 400, "400001" -> 200
+
+Generate for INTEGER/NUMBER fields:
+- Category "Positive": valid value in range, expectedResult="200"
+- Category "Below-Minimum": minimum-1, expectedResult="400"
+- Category "At-Minimum": exact minimum, expectedResult="200"
+- Category "Above-Maximum": maximum+1, expectedResult="400"
+- Category "At-Maximum": exact maximum, expectedResult="200"
+- Category "Negative": -1 if minimum >= 0, expectedResult="400"
+- Category "Zero": 0, expectedResult based on minimum
+- Category "String-Input": "abc", expectedResult="400 type error"
+- Category "Decimal-For-Integer": 1.5 if type=integer, expectedResult="400"
+- Category "Overflow": 9999999999, expectedResult="400"
+
+Generate for ENUM fields:
+- Category "Valid-Enum": each enum value -> 200 PASS
+- Category "Invalid-Enum": "INVALID_VALUE" -> 400 FAIL
+- Category "Case-Sensitive": lowercase of first enum -> 400 FAIL
+
+Generate for BOOLEAN fields:
+- Category "Valid-True": true -> 200
+- Category "Valid-False": false -> 200
+- Category "String-Boolean": "true" string -> 400
+- Category "Integer-Boolean": 1 -> 400
+
+Generate for REQUIRED fields:
+- Category "Required-Missing": omit field entirely -> 400
+  testSteps include: "Do NOT include {field} in request body"
+
+Generate for FORMAT fields:
+- email: valid -> 200, no@ -> 400, double@ -> 400
+- date: YYYY-MM-DD -> 200, DD/MM/YYYY -> 400, Feb 30 -> 400
+- date-time: ISO 8601 with Z -> 200, date only -> 400
+- uuid: valid UUID v4 -> 200, invalid -> 400
+
+If acceptanceCriteria is provided and not empty:
+  Add extra test cases with category "Acceptance-Criteria":
+  Parse the acceptance criteria text line by line.
+  For each line that looks like a rule (contains "should", "must", "cannot", "shall"):
+    Create a positive test case (rule satisfied -> PASS)
+    Create a negative test case (rule violated -> FAIL)
+  testSteps should reference the specific acceptance criterion.
+
+═══════════════════════════════════════════════════════════
+SECTION 7 — AutomationTestCaseGeneratorService.java in com.testgen.service
+═══════════════════════════════════════════════════════════
+
+@Service class. AtomicInteger counter for AT_001 IDs.
+
+generateAutomationTestCases(List<EndpointInfo> endpoints, String acceptanceCriteria, String baseUrl) returns List<TestCase>:
+
+For each endpoint, for each FieldConstraint, generate automation test cases.
+Each TestCase has type=AUTOMATION. The automationCode field contains complete
+RestAssured + JUnit 5 test method code as a String.
+
+Generate the same boundary scenarios as manual but as code.
+automationCode format for each test:
+
+@Test
+@DisplayName("[AT_001] POST /path - fieldName - scenario")
+void at_001_fieldName_scenario() {
+    given()
+        .baseUri("{{BASE_URL}}")
+        .contentType(ContentType.JSON)
+        .header("Authorization", "Bearer {{TOKEN}}")
+        .body("{\"fieldName\": testValue}")
+    .when()
+        .post("/path")
+    .then()
+        .statusCode(400)
+        .body("message", notNullValue());
+}
+
+At the end also generate a base test class string:
+
+@SpringBootTest
+class ApiTestBase {
+    static final String BASE_URL = System.getenv().getOrDefault("API_BASE_URL", "http://localhost:8080");
+    static final String TOKEN = System.getenv().getOrDefault("API_TOKEN", "your_token_here");
+
+    @BeforeAll
+    static void setup() {
+        RestAssured.baseURI = BASE_URL;
+        RestAssured.enableLoggingOfRequestAndResponseIfValidationFails();
+    }
+}
+
+Add RestAssured dependency note in a comment at top of automation test cases.
+
+If acceptanceCriteria provided:
+  Generate @Test methods that cover each acceptance criterion.
+  Method name derived from the criterion text.
+
+═══════════════════════════════════════════════════════════
+SECTION 8 — ClaudeAIService.java in com.testgen.service
+═══════════════════════════════════════════════════════════
+
+@Service class. Inject anthropic.model.
+
+enhanceTestCases(List<EndpointInfo> endpoints, String acceptanceCriteria,
+                 String apiKey, String baseUrl) returns Map<String, List<TestCase>>:
+
+Map has keys "manual" and "automation".
+
+If apiKey is blank or equals "YOUR_ANTHROPIC_API_KEY_HERE": return empty map.
+
+Build prompt:
+  You are a senior QA engineer at a banking company.
+  Analyze these API endpoints and acceptance criteria.
+  Generate additional advanced test cases NOT covered by standard boundary testing.
+  Focus on: banking business rules, cross-field validations, security vulnerabilities,
+  regulatory compliance (KYC, AML), concurrent transactions, account state scenarios.
+
+  Endpoints: {serialize endpoints as JSON}
+  Acceptance Criteria: {acceptanceCriteria}
+
+  Return ONLY a JSON object with two arrays:
+  {
+    "manual": [ { "category":"Business Logic", "scenario":"...", "field":"...",
+      "precondition":"...", "testSteps":"step1\nstep2\nstep3",
+      "testData":"...", "expectedResult":"...", "priority":"High",
+      "httpMethod":"POST", "endpointPath":"/api/..." } ],
+    "automation": [ { "category":"...", "scenario":"...", "field":"...",
+      "testData":"...", "expectedResult":"...", "priority":"High",
+      "httpMethod":"POST", "endpointPath":"/api/...",
+      "automationCode":"@Test\nvoid test() { ... }" } ]
+  }
+
+Call Anthropic API:
+  URL: https://api.anthropic.com/v1/messages
+  Headers: x-api-key: {apiKey}, anthropic-version: 2023-06-01, content-type: application/json
+  Body: { model, max_tokens: 4000, messages: [{role:"user", content: prompt}] }
+  Use Apache HttpClient5 CloseableHttpClient.
+
+Parse response content[0].text as JSON.
+Map to TestCase list with IDs AI_M_001 (manual) and AI_A_001 (automation).
+Type field = "MANUAL" or "AUTOMATION".
+Handle all errors with try-catch, return empty map on failure.
+
+═══════════════════════════════════════════════════════════
+SECTION 9 — ExcelExportService.java in com.testgen.service
+═══════════════════════════════════════════════════════════
+
+@Service. Inject output.directory.
+
+exportToExcel(List<TestCase> manualCases, List<TestCase> automationCases, String apiTitle)
+  throws IOException, returns byte[] (for HTTP download):
+
+Use XSSFWorkbook.
+
+SHEET 1 "Manual Test Cases":
+Headers: TC ID, Type, Endpoint, Method, Field, Category, Scenario,
+Precondition, Test Steps, Test Data, Expected Result, Actual Result, Status, Priority
+Header style: dark navy #1B2A4A background, white bold font size 11
+Column widths (units): 3000,3000,5000,2500,4000,5000,6000,6000,8000,6000,8000,6000,3500,3000
+Data rows: green #D9EAD3 for positive cases, red #FCE4D6 for negative/fail cases
+Auto-filter, freeze row 0, wrap text for all cells, row height 60
+
+SHEET 2 "Automation Test Cases":
+Headers: TC ID, Type, Endpoint, Method, Field, Category, Scenario,
+Test Data, Expected Result, Priority, Automation Code
+Header style same as sheet 1
+automationCode column: Courier New 9pt font, wrap text, row height 100
+
+SHEET 3 "Summary":
+Title "Test Case Report" large bold
+API title, generated date, total manual, total automation,
+by-category breakdown table, by-endpoint breakdown table
+Color-coded count cells
+
+Write workbook to ByteArrayOutputStream and return bytes.
+
+exportToCsv(List<TestCase> allCases) returns byte[]:
+Use Commons CSV. All fields. Return as bytes.
+
+═══════════════════════════════════════════════════════════
+SECTION 10 — TestCaseController.java in com.testgen.controller
+═══════════════════════════════════════════════════════════
+
+@RestController @RequestMapping("/api")
+
+Inject: SwaggerParserService, ManualTestCaseGeneratorService,
+        AutomationTestCaseGeneratorService, ClaudeAIService, ExcelExportService
+
+POST /api/generate — @RequestBody GenerateRequest, returns ResponseEntity<GenerateResponse>:
+  Try block:
+    1. Validate swaggerContent not blank
+    2. Parse swagger: List<EndpointInfo> endpoints = swaggerParser.parseSwagger(request.swaggerContent)
+    3. Generate manual: List<TestCase> manual = manualGenerator.generateManualTestCases(endpoints, request.acceptanceCriteria)
+    4. Generate automation: List<TestCase> automation = automationGenerator.generateAutomationTestCases(endpoints, request.acceptanceCriteria, request.baseUrl)
+    5. If apiKey provided: Map<String,List<TestCase>> aiCases = claudeAI.enhanceTestCases(endpoints, request.acceptanceCriteria, request.apiKey, request.baseUrl)
+       If aiCases not empty: add aiCases.get("manual") to manual list, aiCases.get("automation") to automation list
+    6. Build and return GenerateResponse with success=true, both lists, counts, summary message
+  Catch Exception: return ResponseEntity with success=false and error message
+
+GET /api/download/excel — @RequestParam List<TestCase> (use session or cache) returns Excel file:
+  Actually: POST /api/download/excel with @RequestBody containing both lists
+  Generate Excel bytes, return ResponseEntity with:
+    Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+    Content-Disposition: attachment; filename="TestCases.xlsx"
+    Body: byte[]
+
+POST /api/download/excel — @RequestBody GenerateResponse, returns Excel file as download
+POST /api/download/csv — @RequestBody GenerateResponse, returns CSV file as download
+
+@Controller (not Rest)
+GET "/" — return "index" (serves index.html thymeleaf template)
+
+═══════════════════════════════════════════════════════════
+SECTION 11 — index.html in src/main/resources/templates/
+═══════════════════════════════════════════════════════════
+
+Create a single-page dark themed professional web application.
+Use only vanilla HTML, CSS, JavaScript — no external frameworks needed.
+Use Google Fonts: import 'DM Mono' for code, 'Outfit' for UI.
+All CSS inline in <style> tag. All JS inline in <script> tag.
+
+COLOR SCHEME (CSS variables):
+--bg: #060910
+--surface: #0d1117
+--card: #111827
+--border: #1e2d3d
+--accent: #2563eb
+--accent-glow: rgba(37,99,235,0.15)
+--green: #059669
+--red: #dc2626
+--yellow: #d97706
+--text: #e2e8f0
+--muted: #6b7280
+--mono: 'DM Mono', monospace
+--sans: 'Outfit', sans-serif
+
+LAYOUT — full page single column, max-width 1400px centered:
+
+HEADER section:
+  Left: App logo (circuit board SVG icon) + "TestGen AI" in large bold white
+  Right: Small version badge "v1.0 · Banking QA"
+  Subtitle: "Swagger-Powered Test Case Generator · Manual & Automation"
+  Thin glowing bottom border (box-shadow trick)
+
+MAIN CONTENT — 2 column grid on wide screens, stack on mobile:
+
+LEFT COLUMN — Input Panel (sticky):
+
+  Card 1: "Swagger Input"
+    Drag-and-drop zone:
+      Dashed border, centered icon and text "Drop .yaml or .json here"
+      "or paste content below" subtext
+      On drag-over: border turns blue, background brightens
+      On drop: read file and paste content into textarea
+    Textarea: dark background, monospace font, height 250px
+      placeholder: "# Paste your Swagger YAML or JSON here\n# Or drag a file above\n# Example:\nopenapi: 3.0.0\ninfo:\n  title: My API"
+    Below textarea: small URL option
+      Label "Or enter Swagger URL:" + input field + "Fetch" button
+      On Fetch click: call backend or just put URL in textarea
+
+  Card 2: "Story & Acceptance Criteria"
+    Textarea: height 150px
+      placeholder: "Enter your user story and acceptance criteria:\n\nAs a customer I want to register so that I can access banking services.\n\nAcceptance Criteria:\n- User must provide valid PAN card\n- Mobile number must be 10 digits\n- Email must be unique\n- Age must be 18 or above"
+
+  Card 3: "Configuration"
+    Input: API Base URL, placeholder "http://localhost:8080", default value "http://localhost:8080"
+    Input: Anthropic API Key (type=password), placeholder "sk-ant-... (optional, for AI-enhanced cases)"
+    Small info text: "API key is optional. Without it, boundary cases are still generated."
+    Toggle row: "Include Security Tests" (default on), "Include AI Enhanced" (default on)
+
+  Big Generate Button:
+    Full width, gradient background blue-to-indigo
+    Text: "⚡ Generate Test Cases"
+    On click: show loading state, disable button, call API
+
+RIGHT COLUMN — Results Panel:
+
+  Loading state (hidden by default):
+    Centered spinner animation (CSS keyframe spin)
+    Animated text cycling through: "Parsing Swagger...", "Generating boundary cases...",
+    "Running AI analysis...", "Building test matrix..."
+    Progress bar that fills slowly
+
+  Results section (hidden until generated):
+
+    Stats row — 4 cards side by side:
+      Total Tests (blue), Manual (green), Automation (purple), AI Enhanced (orange)
+      Each with large number and icon, animate count-up on appear
+
+    Tab switcher:
+      Two tabs: "📋 Manual Test Cases" and "⚙️ Automation Test Cases"
+      Active tab: solid blue underline, white text
+      Inactive: muted text
+      Clicking switches visible table
+
+    MANUAL TABLE (shown by default when manual tab active):
+      Sticky header row with columns:
+        TC ID | Endpoint | Method | Field | Category | Scenario | Test Data | Expected Result | Priority
+      Method column: colored badge (green=GET, blue=POST, orange=PUT, red=DELETE)
+      Priority column: colored dot (red=High, yellow=Medium, grey=Low)
+      Category column: styled tag/chip
+      Row hover: slight brightness increase
+      Positive rows: left border green, negative rows: left border red
+      Pagination: show 20 rows, Previous/Next buttons
+      Search box above table: filter rows by any text
+
+    AUTOMATION TABLE (hidden by default):
+      Same columns but replace Precondition/TestSteps with "Automation Code"
+      Automation Code column: dark code block, Courier New font
+        Each code block has a small "Copy" button top-right
+        Syntax highlight keywords: @Test, @DisplayName, given(), when(), then() in blue
+        void, static, class in purple, strings in green, numbers in orange
+
+    Download row:
+      3 buttons side by side:
+        "📥 Download Excel" — calls POST /api/download/excel
+        "📄 Download CSV" — calls POST /api/download/csv
+        "📬 Download Postman" — generates Postman JSON client-side from results
+
+  Empty state (shown when no results yet):
+    Large icon, "Ready to Generate" heading
+    "Fill in the inputs on the left and click Generate" subtext
+
+FOOTER:
+  "Swagger AI Test Generator · Built for Banking QA Teams"
+
+JAVASCRIPT FUNCTIONS:
+
+generateTestCases():
+  Show loading state, hide results
+  Collect: swaggerContent from textarea, acceptanceCriteria, baseUrl, apiKey
+  If swaggerContent is empty: show error toast "Please provide Swagger content"
+  Fetch POST /api/generate with JSON body
+  On success: hide loading, show results, populate tables, animate stats
+  On error: hide loading, show error toast with message
+
+populateManualTable(testCases):
+  Clear existing rows
+  Create <tr> for each case
+  Apply color classes based on expectedResult containing "200" vs "400"
+  Set up pagination (20 per page)
+
+populateAutomationTable(testCases):
+  Same but render automationCode in <pre><code> block
+  Add copy button per row
+
+filterTable(searchText):
+  Hide rows that don't match search text across all visible columns
+
+switchTab(tabName):
+  Show/hide correct table div
+  Update tab active styling
+
+downloadFile(type):
+  POST to /api/download/{type} with current results data
+  Create blob URL and trigger download
+
+showToast(message, type):
+  Create floating toast notification (success=green, error=red)
+  Auto-dismiss after 3 seconds
+
+Drag and drop on swagger drop zone:
+  preventDefault on dragover and drop events
+  On drop: read file as text, put in textarea
+  Visual feedback on drag-over
+
+Fetch Swagger URL button:
+  If URL entered, set textarea value to the URL string
+  (server will handle URL parsing)
+
+Count-up animation for stats numbers:
+  Animate from 0 to final value over 800ms using requestAnimationFrame
+
+Loading text animation:
+  Cycle through loading messages every 1.5 seconds using setInterval
+
+═══════════════════════════════════════════════════════════
+SECTION 12 — PostmanCollectionGenerator in JavaScript (client-side)
+═══════════════════════════════════════════════════════════
+
+In the index.html script section, add generatePostmanCollection(testCases, baseUrl) function:
+
+Builds Postman Collection v2.1 JSON object in memory:
+- info: name "AI Generated Test Cases", schema URL
+- auth: bearer with {{AUTH_TOKEN}}
+- variable: BASE_URL and AUTH_TOKEN
+- item: folders per endpoint > sub-folders per category > request items
+  Each item: name=[TC_ID] scenario, request with method/url/body,
+  pm.test script checking status code
+
+JSON.stringify and trigger download as PostmanCollection.json
+
+═══════════════════════════════════════════════════════════
+SECTION 13 — run.bat (Windows launcher)
+═══════════════════════════════════════════════════════════
+
+@echo off
+Check java -version, if fail print "Java 17+ required" and pause
+Set ANTHROPIC_KEY env from argument 1 if provided
+Run: java -jar swagger-test-agent-1.0.0.jar
+Print "Opening http://localhost:8080 ..."
+If errorlevel 1: print "Failed to start" and pause
+
+═══════════════════════════════════════════════════════════
+SECTION 14 — run.sh (Mac/Linux launcher)
+═══════════════════════════════════════════════════════════
+
+#!/bin/bash
+Check java version >= 17
+java -jar swagger-test-agent-1.0.0.jar "$@"
+
+═══════════════════════════════════════════════════════════
+SECTION 15 — HOW TO BUILD AND RUN
+═══════════════════════════════════════════════════════════
+
+Build:
+  mvn clean package -DskipTests
+  JAR will be at: target/swagger-test-agent-1.0.0.jar
+
+Run on Windows:
+  java -jar swagger-test-agent-1.0.0.jar
+  OR double-click run.bat
+
+Run on Mac/Linux:
+  java -jar swagger-test-agent-1.0.0.jar
+  OR ./run.sh
+
+Browser opens automatically at http://localhost:8080
+
+To use a different port:
+  java -jar swagger-test-agent-1.0.0.jar --server.port=9090
+
+═══════════════════════════════════════════════════════════
+IMPORTANT INSTRUCTIONS FOR CODE GENERATION
+═══════════════════════════════════════════════════════════
+
+1. Generate ALL files completely — no placeholders, no "// TODO implement"
+2. Every method must be fully implemented with real logic
+3. The HTML file must be complete with all CSS and JavaScript working
+4. The drag-and-drop must work
+5. The tab switching must work
+6. The download buttons must trigger real file downloads
+7. Error handling must show user-friendly messages in the UI
+8. The app must compile with: mvn clean package -DskipTests
+9. When run, the browser must open automatically
+10. All test case generation logic must produce real test data values,
+    not placeholder strings
