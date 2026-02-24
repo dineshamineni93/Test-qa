@@ -1,0 +1,529 @@
+Generate a complete, production-ready Spring Boot Maven project called "swagger-test-agent" that acts as an AI-powered test case generator. Below are the full requirements.
+
+═══════════════════════════════════════════
+PROJECT SETUP
+═══════════════════════════════════════════
+
+Group: com.testgen
+Artifact: swagger-test-agent
+Version: 1.0.0
+Java: 17
+Spring Boot: 3.2.0
+Packaging: Executable fat JAR (spring-boot-maven-plugin with executable=true)
+Main class: com.testgen.SwaggerTestAgentApplication
+
+Maven dependencies:
+- spring-boot-starter
+- io.swagger.parser.v3:swagger-parser:2.1.19
+- org.apache.poi:poi-ooxml:5.2.5
+- com.google.code.gson:gson:2.10.1
+- org.apache.httpcomponents.client5:httpclient5:5.3
+- org.apache.commons:commons-csv:1.10.0
+- org.projectlombok:lombok (optional)
+
+═══════════════════════════════════════════
+APPLICATION PROPERTIES
+═══════════════════════════════════════════
+
+Create src/main/resources/application.properties:
+
+anthropic.api.key=YOUR_ANTHROPIC_API_KEY_HERE
+anthropic.model=claude-sonnet-4-6
+swagger.file.path=swagger.yaml
+api.base.url=http://localhost:8080
+output.directory=./test-output
+output.excel.enabled=true
+output.csv.enabled=true
+output.postman.enabled=true
+
+═══════════════════════════════════════════
+PACKAGE STRUCTURE
+═══════════════════════════════════════════
+
+com.testgen
+├── SwaggerTestAgentApplication.java
+├── agent/
+│   └── TestGenerationOrchestrator.java
+├── model/
+│   ├── FieldConstraint.java
+│   ├── EndpointInfo.java
+│   └── TestCase.java
+├── service/
+│   ├── SwaggerParserService.java
+│   ├── BoundaryTestGeneratorService.java
+│   └── ClaudeAIService.java
+└── output/
+    ├── ExcelReportGenerator.java
+    ├── CsvReportGenerator.java
+    └── PostmanCollectionGenerator.java
+
+═══════════════════════════════════════════
+MODEL CLASSES
+═══════════════════════════════════════════
+
+1. FieldConstraint.java — @Data @Builder
+Fields:
+- String fieldName, fieldPath, type, format, pattern, description, exampleValue, defaultValue
+- boolean required, nullable, exclusiveMinimum, exclusiveMaximum
+- Integer minLength, maxLength, minItems, maxItems
+- Double minimum, maximum
+- List<String> enumValues
+
+2. EndpointInfo.java — @Data @Builder
+Fields:
+- String path, method, summary, operationId, requestBodyExample
+- List<String> tags
+- List<FieldConstraint> bodyConstraints
+- List<FieldConstraint> paramConstraints
+- Map<String, String> responses
+
+3. TestCase.java — @Data @Builder
+Fields:
+- String testId, endpointPath, httpMethod, field, category
+- String scenario, testValue, requestPayload
+- String expectedStatus, expectedResult
+- String validationRule, description, priority, testType, junitCode
+
+═══════════════════════════════════════════
+SwaggerParserService.java
+═══════════════════════════════════════════
+
+@Service class. Inject swagger.file.path property.
+
+loadSpec() method:
+- Use OpenAPIV3Parser with ParseOptions: setResolve(true), setResolveFully(true)
+- Supports both local file path AND http/https URL directly
+- Validate result not null, throw RuntimeException if invalid
+- Print API title and version on success
+
+extractEndpoints() method:
+- Iterate openAPI.getPaths() for GET, POST, PUT, PATCH, DELETE
+- For each operation build EndpointInfo with:
+  - path, method, summary, operationId, tags
+  - bodyConstraints from extractBodyConstraints()
+  - paramConstraints from extractParamConstraints()
+  - responses map (status code -> description)
+
+extractBodyConstraints(Operation) private method:
+- Get content from requestBody
+- Prefer application/json media type
+- Call extractSchemaConstraints() on the schema
+
+extractParamConstraints(Operation) private method:
+- For each parameter (path/query/header) extract FieldConstraint
+- Map: name, required, type, format, minLength, maxLength, pattern,
+  minimum, maximum, enum, nullable from parameter schema
+
+extractSchemaConstraints(Schema, String path, List<FieldConstraint>, Set<String> visited) private method:
+- Guard against circular $ref using visited set
+- If schema has properties: iterate each property
+  - Build FieldConstraint with: fieldName, fieldPath (parent.child format),
+    required (check schema.getRequired() list), nullable,
+    type, format, minLength, maxLength, pattern, minimum, maximum,
+    exclusiveMinimum, exclusiveMaximum, minItems, maxItems,
+    enumValues, description, example, default value
+  - Recurse for nested objects (type=object or has properties)
+  - Recurse for array items (type=array, use fieldPath + "[]")
+
+═══════════════════════════════════════════
+BoundaryTestGeneratorService.java
+═══════════════════════════════════════════
+
+@Service class. AtomicInteger counter starting at 1 for TC_0001 IDs.
+
+generateForEndpoint(EndpointInfo) method:
+- Combine bodyConstraints and paramConstraints
+- For each constraint call generateForField()
+- Return combined List<TestCase>
+
+generateForField(EndpointInfo, FieldConstraint) method:
+- Switch on field type: string, integer, number, boolean, array
+- Always add pattern cases if pattern != null
+- Always add enum cases if enumValues not empty
+- Always add required case if required == true
+- Always add null check if nullable == false
+- Always add format cases if format != null
+
+STRING type — generate these test cases:
+- Empty string "" → category="Empty/Blank", expectedStatus=400, result=FAIL
+- Whitespace "   " → category="Empty/Blank", expectedStatus=400, result=FAIL
+- Null value → 400 FAIL if not nullable, else 200 PASS
+- If minLength != null:
+    (minLength-1) chars of 'a' → category="Length-Boundary", 400, FAIL
+    exact minLength chars → 200, PASS
+    (minLength+1) chars → 200, PASS
+- If maxLength != null:
+    (maxLength-1) chars → 200, PASS
+    exact maxLength chars → 200, PASS
+    (maxLength+1) chars → 400, FAIL
+    10000 chars → 400, FAIL (very large string)
+- SQL Injection: "' OR '1'='1'; DROP TABLE users;--" → category="Security-SQLi", 400, FAIL
+- XSS: "<script>alert('XSS')</script>" → category="Security-XSS", 400, FAIL
+- Path traversal: "../../etc/passwd" → category="Security", 400, FAIL
+- Null byte: "value%00injected" → category="Security", 400, FAIL
+- Special chars: "!@#$%^&*()" → category="Special-Chars", 400, FAIL
+- Unicode: "日本語テスト" → category="Unicode", 200, PASS
+
+INTEGER and NUMBER type — generate these test cases:
+- String value "abc" → category="Type-Validation", 400, FAIL
+- Boolean true → 400, FAIL
+- Float 1.5 for integer → 400, FAIL (only if type=integer)
+- Zero 0 → FAIL if minimum > 0, else PASS
+- Negative -1 → FAIL if minimum >= 0, else PASS
+- If minimum != null:
+    (minimum-1) → category="Boundary-Minimum", 400, FAIL
+    exact minimum → 200, PASS
+    (minimum+1) → 200, PASS
+- If maximum != null:
+    (maximum-1) → 200, PASS
+    exact maximum → 200, PASS
+    (maximum+1) → category="Boundary-Maximum", 400, FAIL
+- Overflow: 9999999999999999999 → 400, FAIL
+- Underflow: -9999999999999999999 → 400, FAIL
+
+PATTERN type — generate these test cases:
+- Completely invalid "INVALID###XYZ@@@" → category="Pattern-Validation", 400, FAIL
+- Partial match "partial" → 400, FAIL
+- If pattern contains "@" or description contains "email":
+    "invalidemail.com" (no @) → 400, FAIL
+    "user@" (no domain) → 400, FAIL
+    "user@@domain.com" (double @) → 400, FAIL
+    "user@example.com" → 200, PASS
+- If description contains "phone" or pattern contains "\d{10}":
+    "12345ABCDE" (letters) → 400, FAIL
+    "12345" (too short) → 400, FAIL
+    "9876543210" (valid 10 digits) → 200, PASS
+- If description contains "uuid" or pattern contains "[0-9a-f]{8}":
+    "not-a-valid-uuid" → 400, FAIL
+    "550e8400-e29b-41d4-a716-446655440000" → 200, PASS
+
+ENUM type — generate these test cases:
+- First enum value → 200, PASS
+- Last enum value → 200, PASS (if more than one)
+- "INVALID_ENUM_XYZ_123" → 400, FAIL
+- Lowercase of first enum value → 400, FAIL
+- Numeric 123 → 400, FAIL
+
+BOOLEAN type — generate these test cases:
+- String "true" → 400, FAIL
+- String "false" → 400, FAIL
+- Integer 1 → 400, FAIL
+- Integer 0 → 400, FAIL
+- Boolean true → 200, PASS
+- Boolean false → 200, PASS
+
+ARRAY type — generate these test cases:
+- Empty array [] → FAIL if minItems > 0, else PASS
+- [null] element → 400, FAIL
+- Single element ["item1"] → 200, PASS
+- If minItems != null:
+    array with (minItems-1) items → 400, FAIL
+    array with exact minItems items → 200, PASS
+- If maxItems != null:
+    array with exact maxItems items → 200, PASS
+    array with (maxItems+1) items → 400, FAIL
+
+FORMAT cases — generate based on format field value:
+- format=email: "test@example.com"→PASS, "testexample.com"→FAIL, "test @x.com"→FAIL
+- format=date: "2024-06-15"→PASS, "15-06-2024"→FAIL, "2024-02-30"→FAIL, "9999-12-31"→FAIL
+- format=date-time: "2024-06-15T10:30:00Z"→PASS, "2024-06-15"→FAIL, "2024-06-15T10:30:00+99:00"→FAIL
+- format=uuid: "550e8400-e29b-41d4-a716-446655440000"→PASS, "not-a-uuid"→FAIL, "550e8400-e29b"→FAIL
+
+REQUIRED field — always add:
+- Missing field (null/absent) → 400, FAIL, category="Required-Field"
+
+Each TestCase must populate ALL fields including:
+- testId = TC_0001 format from AtomicInteger
+- validationRule = human readable string of what constraint is tested
+- priority = High for boundary/required/security, Medium for others
+- testType = Boundary / Negative / Positive / Security
+- junitCode = complete @Test method string like:
+  @Test
+  @DisplayName("[TC_0001] fieldName - scenario description")
+  void tc_0001_fieldName_scenario() {
+      ResponseEntity<String> response = restTemplate.exchange(
+          BASE_URL + "/path", HttpMethod.POST,
+          buildRequest("fieldName", testValue), String.class);
+      assertThat(response.getStatusCode().value()).isEqualTo(400);
+  }
+
+═══════════════════════════════════════════
+ClaudeAIService.java
+═══════════════════════════════════════════
+
+@Service class. Inject anthropic.api.key and anthropic.model.
+AtomicInteger counter starting at 5000 for AI cases (TC_5000).
+
+generateAdvancedTestCases(EndpointInfo, List<FieldConstraint>) returns List<TestCase>:
+
+Step 1 — Check API key. If value is "YOUR_ANTHROPIC_API_KEY_HERE" or blank:
+  Print warning message explaining how to set key. Return empty list.
+
+Step 2 — Build prompt String containing:
+  - Endpoint: path, method, summary
+  - Field list: name, type, required, all constraints
+  - Instruction: generate 10-15 test cases for these scenarios:
+    cross-field validation (e.g. startDate before endDate),
+    business logic (e.g. credit limit cannot exceed salary),
+    auth and role boundary tests,
+    data consistency (e.g. update non-existent record),
+    concurrency (e.g. double submit same request),
+    banking domain specific (e.g. account number format, IFSC code, PAN card)
+  - Response format: JSON array only, no markdown, no explanation
+  - Each item: category, scenario, field, testValue, expectedStatus,
+    expectedResult, description, priority, testType
+
+Step 3 — Call Anthropic API using Apache HttpClient5:
+  URL: https://api.anthropic.com/v1/messages
+  Method: POST
+  Headers: x-api-key: {apiKey}, anthropic-version: 2023-06-01, content-type: application/json
+  Body (Gson): { "model": model, "max_tokens": 3000,
+    "messages": [{"role": "user", "content": prompt}] }
+  Parse response: content[0].text field
+
+Step 4 — Parse JSON array from response into List<TestCase>:
+  - Extract JSON array (find first [ to last ])
+  - Map each object to TestCase
+  - Set testId = TC_5000, TC_5001 etc.
+  - Set category = "AI: " + original category
+  - Set endpointPath and httpMethod from endpoint
+  - Set junitCode = @Test stub with TODO comment
+  - Wrap everything in try-catch, print warning on failure
+
+═══════════════════════════════════════════
+ExcelReportGenerator.java
+═══════════════════════════════════════════
+
+@Component. Inject output.directory.
+
+generate(List<TestCase> testCases, String apiTitle) throws IOException, returns String filename.
+
+Use XSSFWorkbook to create file: output.directory + "/TestCases_" + yyyyMMdd_HHmmss + ".xlsx"
+
+SHEET 1 — "Summary":
+- Row 0: Title "Swagger AI Test Case Report" merged A0:D0, large blue bold font
+- Row 2: label "API Title" + value
+- Row 3: label "Generated At" + LocalDateTime formatted
+- Row 4: label "Total Test Cases" + count
+- Row 5: label "Positive (PASS)" + count
+- Row 6: label "Negative (FAIL)" + count
+- Row 7: label "High Priority" + count
+- Row 8: label "AI-Generated Cases" + count (category starts with "AI:")
+- Row 10: header "Category" | "Count" with blue background white font
+- Rows 11+: for each category name and its count using groupingBy
+- Then gap row, header "Endpoint" | "Count", then endpoint counts
+
+SHEET 2 — "All Test Cases":
+- Header row with dark blue (#1F4E79) background, white bold font
+- Columns: TC ID, Endpoint, Method, Field, Category, Scenario, Test Value,
+  Expected Status, Expected Result, Validation Rule, Priority, Test Type, Description
+- Column widths: 3000, 6000, 2500, 5000, 5000, 8000, 6000, 3500, 3500, 7000, 3000, 3500, 10000
+- Row style: green (#C6EFCE) for PASS, red (#FFCCCC) for FAIL, purple (#E3D5F5) for AI cases
+- setAutoFilter on header row
+- createFreezePane(0, 1) to freeze header
+
+SHEET 3+ — One sheet per endpoint:
+- Sheet name = sanitize("METHOD /path") to max 31 chars, replace invalid chars with _
+- Same format as Sheet 2 but only that endpoint's test cases
+
+SHEET 4 — "JUnit Code":
+- Courier New 9pt font for all cells
+- Row 0: base test class template text:
+    @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+    class ApiTests {
+        @LocalServerPort int port;
+        TestRestTemplate restTemplate = new TestRestTemplate();
+        String BASE_URL;
+        HttpHeaders headers = new HttpHeaders();
+        @BeforeEach void setUp() {
+            BASE_URL = "http://localhost:" + port;
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            headers.set("Authorization", "Bearer YOUR_TOKEN_HERE");
+        }
+        HttpEntity<String> buildRequest(String field, Object value) {
+            return new HttpEntity<>("{\""+field+"\":\""+value+"\"}", headers);
+        }
+    }
+- One row per TestCase containing tc.getJunitCode(), row height 80pt
+
+Create method createStyle(XSSFWorkbook, String hexColor) for row styles.
+Create method createHeaderStyle(XSSFWorkbook) for header rows.
+Auto-size columns where possible. mkdir outputs directory if not exists.
+
+═══════════════════════════════════════════
+CsvReportGenerator.java
+═══════════════════════════════════════════
+
+@Component. Inject output.directory.
+
+generate(List<TestCase>) returns String filename.
+Use Apache Commons CSVFormat.DEFAULT with header.
+Headers: TC_ID, Endpoint, Method, Field, Category, Scenario,
+Test_Value, Expected_Status, Expected_Result, Validation_Rule,
+Priority, Test_Type, Description
+Save as output.directory + "/TestCases_" + timestamp + ".csv"
+Print filename. Return filename.
+
+═══════════════════════════════════════════
+PostmanCollectionGenerator.java
+═══════════════════════════════════════════
+
+@Component. Inject output.directory and api.base.url. Use Gson.
+
+generate(List<TestCase>, List<EndpointInfo>, String apiTitle) returns String filename.
+
+Build Postman Collection v2.1 JSON structure:
+
+Root object:
+- info: { name: apiTitle+" - AI Generated Tests", schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" }
+- auth: { type: "bearer", bearer: [{ key: "token", value: "{{AUTH_TOKEN}}", type: "string" }] }
+- variable: [ { key: "BASE_URL", value: api.base.url }, { key: "AUTH_TOKEN", value: "your_token_here" } ]
+- item: array of folder objects grouped by endpoint
+
+Each endpoint folder:
+- name: "METHOD /path"
+- item: array of category sub-folders
+
+Each category sub-folder:
+- name: category string
+- item: array of request items
+
+Each request item:
+- name: "[TC_0001] scenario text"
+- request object:
+    method: httpMethod
+    header: [ {key:"Content-Type", value:"application/json"}, {key:"Accept", value:"application/json"} ]
+    url: { raw: "{{BASE_URL}}/path", host: ["{{BASE_URL}}"], path: [split path parts] }
+    body (for non-GET): { mode: "raw", raw: JSON with field and testValue, options: {raw:{language:"json"}} }
+    description: "Category: X\nExpected Status: X\nExpected Result: X\nPriority: X\nDescription: X"
+- event array with test script:
+    listen: "test"
+    script.exec array:
+      pm.test("[TC_0001] Status is 200", function() { pm.response.to.have.status(200); });
+      if FAIL: also check pm.response.json() has error or message property
+
+Build payload helper: if field != "multiple", create {"field": value} JSON.
+Handle numeric, boolean, null, array values without extra quotes.
+
+Save as output.directory + "/PostmanCollection_" + timestamp + ".json"
+
+═══════════════════════════════════════════
+TestGenerationOrchestrator.java
+═══════════════════════════════════════════
+
+@Component. Constructor inject all 6 services and generators.
+Inject output.excel.enabled, output.csv.enabled, output.postman.enabled.
+
+public void run() method:
+
+Print banner:
+╔══════════════════════════════════════════╗
+║   Swagger AI Test Case Generator         ║
+╚══════════════════════════════════════════╝
+
+STEP 1 — Parse:
+Print step header. Call parserService.loadSpec() and extractEndpoints().
+Get API title from openAPI.getInfo().getTitle().
+Print endpoint count.
+
+STEP 2 — Generate:
+Print step header.
+For each EndpointInfo:
+  Print endpoint method + path.
+  Get constraints = bodyConstraints if not empty, else paramConstraints.
+  Call boundaryGenerator.generateForEndpoint(endpoint). Print count.
+  Call claudeAI.generateAdvancedTestCases(endpoint, constraints). Print count.
+  Add all to List<TestCase> allTestCases.
+
+STEP 3 — Output:
+Print step header.
+List<String> generatedFiles = new ArrayList<>()
+If excelEnabled: generatedFiles.add(excelGenerator.generate(allTestCases, apiTitle))
+If csvEnabled: generatedFiles.add(csvGenerator.generate(allTestCases))
+If postmanEnabled: generatedFiles.add(postmanGenerator.generate(allTestCases, endpoints, apiTitle))
+
+STEP 4 — Summary:
+Compute: passCount, failCount, highCount, aiCount, duration ms.
+Print formatted summary box with all counts and list of generated file paths.
+
+Wrap all in try-catch. On exception: print error message, e.printStackTrace(), System.exit(1).
+
+═══════════════════════════════════════════
+SwaggerTestAgentApplication.java
+═══════════════════════════════════════════
+
+@SpringBootApplication class.
+public static void main(String[] args) calls SpringApplication.run().
+
+@Bean CommandLineRunner run(TestGenerationOrchestrator orchestrator):
+  Print welcome banner.
+  Call orchestrator.run().
+
+═══════════════════════════════════════════
+run.bat (Windows launcher script)
+═══════════════════════════════════════════
+
+Create run.bat in project root:
+- Check java -version, exit with error if not found
+- Accept 3 optional args: %1=swagger file or URL, %2=api base url, %3=api key
+- Default values if args missing
+- Run: java -jar swagger-test-agent-1.0.0.jar --swagger.file.path="%1" --api.base.url="%2" --anthropic.api.key="%3"
+- On success: print Done and open test-output folder with explorer
+- On failure: print error message
+
+═══════════════════════════════════════════
+SAMPLE swagger.yaml (for testing)
+═══════════════════════════════════════════
+
+Create swagger.yaml in project root with a realistic banking API:
+
+POST /api/customers/register with fields:
+  firstName: string, minLength:2, maxLength:50, pattern:^[A-Za-z ]+$, required
+  lastName: string, minLength:2, maxLength:50, required
+  email: string, format:email, maxLength:100, required
+  mobile: string, pattern:^\d{10}$, required
+  dateOfBirth: string, format:date, required
+  panCard: string, pattern:^[A-Z]{5}[0-9]{4}[A-Z]{1}$, required
+  annualIncome: number, minimum:0, maximum:100000000, required
+  accountType: string, enum:[SAVINGS,CURRENT,SALARY,FD], required
+  pinCode: string, pattern:^\d{6}$, required
+  referralCode: string, minLength:6, maxLength:10, nullable:true
+
+GET /api/customers/{customerId} with:
+  customerId: path param, string, format:uuid, required
+
+POST /api/transactions with fields:
+  fromAccountNumber: string, pattern:^\d{12}$, required
+  toAccountNumber: string, pattern:^\d{12}$, required
+  amount: number, minimum:1, maximum:1000000, required
+  transactionType: string, enum:[NEFT,RTGS,IMPS,UPI], required
+  remarks: string, maxLength:200, nullable:true
+  transactionPin: string, minLength:4, maxLength:6, pattern:^\d+$, required
+
+═══════════════════════════════════════════
+HOW TO BUILD AND RUN
+═══════════════════════════════════════════
+
+After generating all files:
+
+1. Build:
+   mvn clean package -DskipTests
+
+2. Run with local file:
+   java -jar target/swagger-test-agent-1.0.0.jar
+
+3. Run with live Swagger URL:
+   java -jar target/swagger-test-agent-1.0.0.jar --swagger.file.path=http://localhost:8080/v3/api-docs
+
+4. Run with all args:
+   java -jar target/swagger-test-agent-1.0.0.jar ^
+     --swagger.file.path=http://localhost:8080/v3/api-docs ^
+     --api.base.url=http://localhost:8080 ^
+     --anthropic.api.key=sk-ant-your-key-here
+
+5. Output files will be in ./test-output/:
+   - TestCases_20240615_103045.xlsx  (Excel with 4 sheets)
+   - TestCases_20240615_103045.csv   (Flat CSV)
+   - PostmanCollection_20240615_103045.json (Import into Postman)
+
+Generate ALL files completely with no placeholders or TODOs in the main logic.
