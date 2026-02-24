@@ -1,0 +1,349 @@
+Here are **ready-to-use prompts** you can type into your IDE's Copilot/Claude. Use them **in sequence** — one at a time.
+
+---
+
+## 📋 Step-by-Step Prompts for Your IDE
+
+---
+
+### 🟦 PROMPT 1 — Create the Project Structure
+
+```
+Create a Spring Boot Maven project called "swagger-test-agent" with Java 17.
+
+Add these dependencies in pom.xml:
+- spring-boot-starter-parent 3.2.0
+- io.swagger.parser.v3:swagger-parser:2.1.19
+- org.apache.poi:poi-ooxml:5.2.5
+- com.google.code.gson:gson:2.10.1
+- org.apache.httpcomponents.client5:httpclient5:5.3
+- org.apache.commons:commons-csv:1.10.0
+- org.projectlombok:lombok
+
+Configure spring-boot-maven-plugin to build an executable fat JAR 
+with mainClass as com.testgen.SwaggerTestAgentApplication.
+
+Create application.properties with these keys:
+- anthropic.api.key=YOUR_KEY
+- swagger.file.path=swagger.yaml
+- api.base.url=http://localhost:8080
+- output.directory=./test-output
+- output.excel.enabled=true
+- output.csv.enabled=true
+- output.postman.enabled=true
+- anthropic.model=claude-sonnet-4-6
+```
+
+---
+
+### 🟦 PROMPT 2 — Create the Model Classes
+
+```
+In package com.testgen.model, create 3 Lombok @Data @Builder classes:
+
+1. TestCase.java with fields:
+   String testId, endpointPath, httpMethod, field, category, scenario,
+   testValue, requestPayload, expectedStatus, expectedResult,
+   validationRule, description, priority, testType, junitCode
+
+2. FieldConstraint.java with fields:
+   String fieldName, fieldPath, type, format, description, exampleValue, defaultValue, pattern
+   boolean required, nullable, exclusiveMinimum, exclusiveMaximum
+   Integer minLength, maxLength, minItems, maxItems
+   Double minimum, maximum
+   List<String> enumValues
+
+3. EndpointInfo.java with fields:
+   String path, method, summary, operationId, requestBodyExample
+   List<String> tags
+   List<FieldConstraint> bodyConstraints, paramConstraints
+   Map<String, String> responses
+```
+
+---
+
+### 🟦 PROMPT 3 — Create the Swagger Parser Service
+
+```
+In package com.testgen.service, create SwaggerParserService.java:
+
+- @Service class
+- @Value inject swagger.file.path property
+- loadSpec() method: use OpenAPIV3Parser with ParseOptions 
+  (setResolve=true, setResolveFully=true), support both file path and HTTP URL
+- extractEndpoints() method: iterate openAPI.getPaths(), 
+  extract GET/POST/PUT/PATCH/DELETE operations
+- For each operation extract:
+  - path, method, summary, operationId, tags
+  - requestBody constraints by resolving content -> application/json -> schema
+  - parameters (path, query) constraints
+  - responses map (status code -> description)
+- extractSchemaConstraints() private method: recursively walk schema properties,
+  extract minLength, maxLength, pattern, minimum, maximum, enum, required,
+  nullable, format, type for each field. Handle nested objects and arrays.
+- Return List<EndpointInfo>
+```
+
+---
+
+### 🟦 PROMPT 4 — Create the Boundary Test Generator
+
+```
+In package com.testgen.service, create BoundaryTestGeneratorService.java:
+
+@Service class with AtomicInteger counter for TC_0001 style IDs.
+
+Method generateForEndpoint(EndpointInfo) returns List<TestCase>.
+For each field constraint call generateForField() which switches on type:
+
+For STRING fields generate these test cases:
+- Empty string "" -> expectedStatus 400, FAIL
+- Whitespace "   " -> 400, FAIL  
+- Null value -> 400 FAIL if not nullable
+- If minLength exists: (min-1) chars -> FAIL, exact min -> PASS, (min+1) -> PASS
+- If maxLength exists: (max-1) -> PASS, exact max -> PASS, (max+1) -> FAIL, 10000 chars -> FAIL
+- SQL injection: ' OR '1'='1 -> FAIL
+- XSS: <script>alert(1)</script> -> FAIL
+- Path traversal: ../../etc/passwd -> FAIL
+- Special chars !@#$%^&*() -> FAIL
+- Unicode Japanese chars -> PASS
+
+For INTEGER/NUMBER fields:
+- String "abc" -> FAIL
+- Float 1.5 for integer -> FAIL
+- Zero -> PASS or FAIL based on minimum
+- Negative -1 -> FAIL if minimum >= 0
+- If minimum: (min-1) -> FAIL, exact min -> PASS, (min+1) -> PASS
+- If maximum: (max-1) -> PASS, exact max -> PASS, (max+1) -> FAIL
+- Overflow 9999999999 -> FAIL
+
+For PATTERN fields:
+- Completely invalid value -> FAIL
+- Partial match -> FAIL
+- If pattern contains @ or description has email: test missing @, missing domain, valid email
+- If description has phone: test letters in phone, too short, valid 10 digit
+
+For ENUM fields:
+- First valid enum -> PASS
+- Last valid enum -> PASS  
+- INVALID_ENUM_XYZ -> FAIL
+- Lowercase of valid enum -> FAIL
+
+For BOOLEAN fields:
+- String "true" -> FAIL, String "false" -> FAIL
+- Integer 1 -> FAIL, Integer 0 -> FAIL
+- Boolean true -> PASS, Boolean false -> PASS
+
+For ARRAY fields:
+- Empty array -> FAIL if minItems > 0
+- If minItems: below min -> FAIL, exact min -> PASS
+- If maxItems: exact max -> PASS, (max+1) -> FAIL
+
+For FORMAT fields (email, date, date-time, uuid):
+- email: valid -> PASS, no @ -> FAIL, spaces -> FAIL
+- date: valid YYYY-MM-DD -> PASS, DD-MM-YYYY -> FAIL, Feb 30 -> FAIL
+- uuid: valid UUID -> PASS, truncated -> FAIL
+
+Always add for required fields: missing field -> FAIL
+
+Each TestCase must have: testId, category, scenario, testValue, 
+expectedStatus, expectedResult, description, priority, testType, 
+and a junitCode string with @Test @DisplayName method using RestTemplate.
+```
+
+---
+
+### 🟦 PROMPT 5 — Create the Claude AI Service
+
+```
+In package com.testgen.service, create ClaudeAIService.java:
+
+@Service class that calls Anthropic Claude API to generate advanced test cases.
+
+@Value inject: anthropic.api.key and anthropic.model
+
+Method generateAdvancedTestCases(EndpointInfo, List<FieldConstraint>) returns List<TestCase>:
+
+1. If API key is not configured print warning and return empty list
+
+2. Build a prompt string containing:
+   - Endpoint path, method, summary
+   - All field constraints (name, type, required, minLength, maxLength, pattern, min, max, enum, format)
+   - Ask Claude to generate 10-15 advanced test cases for:
+     cross-field validations, business logic, auth boundaries, 
+     data consistency, industry-specific scenarios
+   - Ask for JSON array response only, no markdown, with fields:
+     category, scenario, field, testValue, expectedStatus, 
+     expectedResult, description, priority, testType
+
+3. Call Anthropic API using Apache HttpClient5:
+   - POST to https://api.anthropic.com/v1/messages
+   - Headers: x-api-key, anthropic-version: 2023-06-01, content-type: application/json
+   - Body: model, max_tokens 3000, messages array with user role and prompt
+   - Parse response: content[0].text
+
+4. Parse the JSON array response into List<TestCase>
+   - TestCase IDs start from TC_5000 to distinguish AI cases
+   - Category prefix with "AI: "
+   - Handle parse errors gracefully
+
+Use Gson for JSON operations. Use try-catch around everything.
+```
+
+---
+
+### 🟦 PROMPT 6 — Create Excel Report Generator
+
+```
+In package com.testgen.output, create ExcelReportGenerator.java:
+
+@Component using Apache POI XSSFWorkbook. @Value inject output.directory.
+
+Method generate(List<TestCase> testCases, String apiTitle) throws IOException, returns filename String.
+
+Create Excel with 4 sheets:
+
+SHEET 1 "Summary":
+- Title row: "Swagger AI Test Case Report" with large blue font
+- Info rows: API Title, Generated At timestamp, Total cases, 
+  PASS count, FAIL count, High Priority count, AI-Generated count
+- Table: test cases grouped by Category with counts
+- Table: test cases grouped by Endpoint with counts
+
+SHEET 2 "All Test Cases":
+- Headers: TC ID, Endpoint, Method, Field, Category, Scenario, 
+  Test Value, Expected Status, Expected Result, Validation Rule, 
+  Priority, Test Type, Description
+- Header row: dark blue background, white bold font
+- Data rows: green background for PASS, red for FAIL, purple for AI cases
+- Auto-filter on header row, freeze top row
+- Auto-size columns
+
+SHEET 3: One sheet per endpoint named "METHOD /path"
+- Same format as Sheet 2 but only that endpoint's cases
+
+SHEET 4 "JUnit Code":
+- Courier New 9pt font
+- First row: base test class template with @SpringBootTest, 
+  TestRestTemplate, AUTH_HEADERS, buildRequest helper method
+- Then one row per test case containing the junitCode string from TestCase
+
+Save file as output.directory + "/TestCases_" + timestamp + ".xlsx"
+```
+
+---
+
+### 🟦 PROMPT 7 — Create CSV and Postman Generators
+
+```
+In package com.testgen.output:
+
+1. Create CsvReportGenerator.java:
+   @Component, use Apache Commons CSV.
+   Method generate(List<TestCase>) returns filename.
+   Headers: TC_ID, Endpoint, Method, Field, Category, Scenario, 
+   Test_Value, Expected_Status, Expected_Result, Validation_Rule, 
+   Priority, Test_Type, Description
+   Save as output.directory + "/TestCases_" + timestamp + ".csv"
+
+2. Create PostmanCollectionGenerator.java:
+   @Component, use Gson. @Value inject output.directory and api.base.url.
+   Method generate(List<TestCase>, List<EndpointInfo>, String apiTitle) returns filename.
+   
+   Build Postman Collection v2.1 JSON with:
+   - info: name, description, schema URL
+   - auth: bearer type with {{AUTH_TOKEN}} variable
+   - variable: BASE_URL and AUTH_TOKEN
+   - items: folders per endpoint -> sub-folders per category -> request items
+   
+   Each request item must have:
+   - name: [TC_ID] scenario
+   - request: method, headers (Content-Type, Accept), 
+     url with {{BASE_URL}} prefix, body with the testValue as JSON
+   - description: category, expectedStatus, expectedResult, rule, priority
+   - event with test script: pm.test checking response status code equals expectedStatus
+     and for FAIL cases check response has error or message property
+   
+   Save as output.directory + "/PostmanCollection_" + timestamp + ".json"
+```
+
+---
+
+### 🟦 PROMPT 8 — Create the Orchestrator and Main Class
+
+```
+In package com.testgen.agent, create TestGenerationOrchestrator.java:
+
+@Component with constructor injection of all services:
+SwaggerParserService, BoundaryTestGeneratorService, ClaudeAIService,
+ExcelReportGenerator, CsvReportGenerator, PostmanCollectionGenerator
+
+@Value inject: output.excel.enabled, output.csv.enabled, output.postman.enabled
+
+public void run() method:
+
+STEP 1 - Parse:
+  Print step header. Call parserService.loadSpec() and extractEndpoints().
+  Get API title from openAPI.getInfo().getTitle()
+
+STEP 2 - Generate test cases:
+  For each endpoint:
+    - Print endpoint method + path
+    - Call boundaryGenerator.generateForEndpoint(endpoint) -> print count
+    - Call claudeAIService.generateAdvancedTestCases(endpoint, constraints) -> print count
+    - Combine both into allTestCases list
+
+STEP 3 - Generate outputs:
+  If excel enabled: call excelGenerator.generate() -> collect filename
+  If csv enabled: call csvGenerator.generate() -> collect filename
+  If postman enabled: call postmanGenerator.generate() -> collect filename
+
+STEP 4 - Print summary box showing:
+  endpoints processed, total test cases, PASS count, FAIL count, 
+  High priority count, AI-generated count, time taken, output file paths
+
+Wrap everything in try-catch, print error and System.exit(1) on failure.
+
+---
+
+In com.testgen package, create SwaggerTestAgentApplication.java:
+@SpringBootApplication class.
+main() calls SpringApplication.run()
+@Bean CommandLineRunner that injects TestGenerationOrchestrator and calls orchestrator.run()
+Print a welcome banner before calling run().
+```
+
+---
+
+### 🟦 PROMPT 9 — Build and Run Instructions
+
+Type this final prompt to get the run commands:
+
+```
+Now show me:
+1. The mvn command to build a fat executable JAR from this project
+2. How to run the JAR with swagger file path as http://localhost:8080/v3/api-docs
+   and api base url and anthropic api key as command line arguments
+3. A run.bat script for Windows that accepts swagger URL as first argument,
+   api base url as second, and anthropic key as third argument,
+   with Java version check before running
+4. What output files will be created and where
+```
+
+---
+
+## 🗂️ Use Them in This Order
+
+```
+Prompt 1 → pom.xml + project setup
+Prompt 2 → Model classes
+Prompt 3 → SwaggerParserService
+Prompt 4 → BoundaryTestGeneratorService  ← biggest one
+Prompt 5 → ClaudeAIService
+Prompt 6 → ExcelReportGenerator
+Prompt 7 → CSV + Postman generators
+Prompt 8 → Orchestrator + Main class
+Prompt 9 → Build + run commands
+```
+
+> **Tip:** After each prompt, if Copilot/Claude gives an incomplete response, follow up with: *"Continue from where you left off"* or *"Complete the remaining methods"*
